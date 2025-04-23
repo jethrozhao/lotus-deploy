@@ -20,9 +20,10 @@ export async function POST(req: Request) {
       body: JSON.stringify({
         query,
         include_answer: true,
-        include_domains: ["*.gov", "company-domain.com", "medium.com"],
-        topic: "news",
-        time_range: "week",
+        max_results: 20,
+        // include_domains: ["*.gov", "company-domain.com", "medium.com"],
+        // topic: "news",
+        // time_range: "week",
         search_depth: "advanced",
         api_key: TAVILY_API_KEY,
         include_images: includeImages,

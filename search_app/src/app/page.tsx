@@ -10,8 +10,27 @@ interface Message {
   content: string;
   reasoning?: string;
   searchResults?: SearchResult[];
+  twitterResults?: TwitterResult[];
   fullTavilyData?: TavilyResponse;
   reasoningInput?: string;
+}
+
+interface TwitterResult {
+  id: string;
+  text: string;
+  author_id: string;
+  created_at: string;
+  public_metrics?: {
+    retweet_count: number;
+    reply_count: number;
+    like_count: number;
+    quote_count: number;
+  };
+  author?: {
+    username: string;
+    name: string;
+    profile_image_url?: string;
+  };
 }
 
 interface TavilyImage {
@@ -38,6 +57,7 @@ interface TavilyResponse {
 interface ChatSection {
   query: string;
   searchResults: SearchResult[];
+  twitterResults?: TwitterResult[];
   reasoning: string;
   response: string;
   error?: string | null;
@@ -78,10 +98,10 @@ export default function Home() {
   const [selectedSuggestion, setSelectedSuggestion] = useState<string | null>(null);
   
   const suggestions: SuggestionType[] = [
-    { label: "Podcast Outline", prefix: "Create a detailed podcast outline for: " },
-    { label: "YouTube Video Research", prefix: "Research and outline a YouTube video about: " },
-    { label: "Short Form Hook Ideas", prefix: "Generate engaging hook ideas for short-form content about: " },
-    { label: "Newsletter Draft", prefix: "Write a newsletter draft about: " }
+    { label: "Twitter Updates", prefix: "Create a detailed podcast outline for: " },
+    { label: "News Headlines", prefix: "Research and outline a YouTube video about: " },
+    { label: "Government Regulations", prefix: "Generate engaging hook ideas for short-form content about: " },
+    { label: "Company Announcements", prefix: "Write a newsletter draft about: " }
   ];
 
   const handleSuggestionClick = (suggestion: SuggestionType) => {
@@ -124,26 +144,40 @@ export default function Home() {
     const sectionIndex = chatSections.length;
 
     try {
-      // Step 1: Search with Tavily
-      const searchResponse = await fetch('/api/tavily', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          query: input,
-          includeImages: true,
-          includeImageDescriptions: true
+      // Step 1: Search with Tavily and Apify in parallel
+      const [searchResponse, apifyResponse] = await Promise.all([
+        fetch('/api/tavily', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            query: input,
+            includeImages: true,
+            includeImageDescriptions: true
+          }),
+          signal: abortControllerRef.current.signal,
         }),
-        signal: abortControllerRef.current.signal,
-      });
+        fetch('/api/apify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            query: input,
+            max_results: 10
+          }),
+          signal: abortControllerRef.current.signal,
+        })
+      ]);
 
-      const searchData = await searchResponse.json();
+      const [searchData, apifyData] = await Promise.all([
+        searchResponse.json(),
+        apifyResponse.json()
+      ]);
       
       if (!searchResponse.ok) {
         throw new Error(searchData.error || 'Failed to fetch search results');
       }
 
-      if (!searchData.results || searchData.results.length === 0) {
-        throw new Error('No relevant search results found. Please try a different query.');
+      if (!apifyResponse.ok) {
+        console.error('Apify search failed:', apifyData.error);
       }
 
       // Combine images with results
@@ -158,6 +192,7 @@ export default function Home() {
         updated[sectionIndex] = {
           ...updated[sectionIndex],
           searchResults: resultsWithImages,
+          twitterResults: apifyData.data || [],
           isLoadingSources: false,
           isLoadingThinking: true
         };
@@ -171,6 +206,14 @@ export default function Home() {
         )
         .join('\n\n');
 
+      const apifyContext = apifyData.data
+        ? `\n\nRecent Social Media Posts:\n${apifyData.data
+            .map((post: TwitterResult, index: number) => 
+              `[Post ${index + 1}]: ${post.text}\nAuthor: ${post.author?.name || 'Unknown'}\nLikes: ${post.public_metrics?.like_count || 0}\n`
+            )
+            .join('\n')}`
+        : '';
+
       const tavilyAnswer = searchData.answer 
         ? `\nTavily's Direct Answer: ${searchData.answer}\n\n` 
         : '';
@@ -179,15 +222,22 @@ export default function Home() {
       const sourcesTable = `\n\n## Sources\n| Number | Source | Description |\n|---------|---------|-------------|\n` +
         resultsWithImages.map((result: SearchResult, index: number) => 
           `| ${index + 1} | [${result.title}](${result.url}) | ${result.snippet || result.content.slice(0, 150)}${result.content.length > 150 ? '...' : ''} |`
-        ).join('\n');
+        ).join('\n') +
+        (apifyData.data && apifyData.data.length > 0 
+          ? `\n\n## Social Media Sources\n| Number | Author | Post |\n|---------|---------|--------|\n` +
+            apifyData.data.map((post: TwitterResult, index: number) => 
+              `| ${index + 1} | [${post.author?.name || 'Unknown'}](${post.author ? `https://twitter.com/${post.author.username}` : '#'}) | ${post.text.slice(0, 150)}${post.text.length > 150 ? '...' : ''} |`
+            ).join('\n')
+          : '');
 
-      const reasoningInput = `Here is the research data:${tavilyAnswer}\n${searchContext}\n\nPlease analyze this information and create a detailed report addressing the original query: "${input}". Include citations to the sources where appropriate. If the sources contain any potential biases or conflicting information, please note that in your analysis.\n\nIMPORTANT: Always end your response with a sources table listing all references used. Format it exactly as shown below:\n${sourcesTable}`;
+      const reasoningInput = `Here is the research data:${tavilyAnswer}\n${searchContext}\n${apifyContext}\n\nPlease analyze this information and create a detailed report addressing the original query: "${input}". Include citations to the sources where appropriate. If the sources contain any potential biases or conflicting information, please note that in your analysis.\n\nIMPORTANT: Always end your response with a sources table listing all references used. Format it exactly as shown below:\n${sourcesTable}`;
 
       let assistantMessage: Message = {
         role: 'assistant',
         content: '',
         reasoning: '',
         searchResults: resultsWithImages,
+        twitterResults: apifyData.data || [],
         fullTavilyData: searchData,
         reasoningInput
       };
@@ -196,37 +246,68 @@ export default function Home() {
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: [
-          userMessage,
-          {
-            role: 'assistant' as const,
-            content: 'I found some relevant information. Let me analyze it and create a comprehensive report.',
-          },
-          {
-            role: 'user' as const,
-            content: reasoningInput,
-          },
-        ] }),
+        body: JSON.stringify({ 
+          messages: [
+            userMessage,
+            {
+              role: 'assistant' as const,
+              content: 'I found some relevant information. Let me analyze it and create a comprehensive report.',
+            },
+            {
+              role: 'user' as const,
+              content: reasoningInput,
+            },
+            {
+              role: 'assistant' as const,
+              content: 'Here is the social media data I found:',
+              searchResults: resultsWithImages,
+              twitterResults: apifyData.data || [],
+              fullTavilyData: searchData
+            }
+          ],
+          context: {
+            searchResults: resultsWithImages,
+            socialMediaResults: apifyData.data || [],
+            tavilyData: searchData
+          }
+        }),
         signal: abortControllerRef.current.signal,
       });
 
       if (!response.ok) {
-        throw new Error('Failed to generate report. Please try again.');
+        const errorData = await response.json();
+        console.error('Chat API Error:', errorData);
+        throw new Error(errorData.error || 'Failed to generate report. Please try again.');
       }
 
       const reader = response.body?.getReader();
-      if (!reader) throw new Error('No reader available');
+      if (!reader) {
+        console.error('No reader available from response');
+        throw new Error('Failed to read response stream');
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = '';
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
-        const chunk = new TextDecoder().decode(value);
-        const lines = chunk.split('\n').filter(line => line.trim());
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // Keep the last incomplete line in the buffer
 
         for (const line of lines) {
+          if (line.trim() === '') continue;
+          if (line.trim() === 'data: [DONE]') continue;
+
+          let data = line;
+          if (line.startsWith('data: ')) {
+            data = line.slice(6);
+          }
+
           try {
-            const parsed = JSON.parse(line);
+            const parsed = JSON.parse(data);
             if (parsed.choices?.[0]?.delta?.reasoning_content) {
               const newReasoning = (assistantMessage.reasoning || '') + parsed.choices[0].delta.reasoning_content;
               assistantMessage.reasoning = newReasoning;
@@ -308,13 +389,13 @@ export default function Home() {
       <TopBar />
       <div className="pt-14 pb-24"> {/* Add padding top to account for fixed header */}
         <main className="max-w-3xl mx-auto p-8">
-          <AnimatePresence>
+          <AnimatePresence mode="wait">
             {!hasSubmitted ? (
               <motion.div 
                 className="min-h-screen flex flex-col items-center justify-center"
                 initial={{ opacity: 1 }}
                 exit={{ opacity: 0, y: -50 }}
-                transition={{ duration: 0.3 }}
+                transition={{ duration: 0.2 }}
               >
                 <div className="text-center mb-12">
                   <div className="inline-block px-4 py-1.5 bg-gray-900 text-white rounded-full text-sm font-medium mb-6">
@@ -374,7 +455,7 @@ export default function Home() {
                 className="space-y-6 pb-32"
                 initial={{ opacity: 0, y: 20 }}
                 animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.3 }}
+                transition={{ duration: 0.2 }}
               >
                 {chatSections.map((section, index) => (
                   <div key={index} className="pt-8 border-b border-gray-200 last:border-0">
